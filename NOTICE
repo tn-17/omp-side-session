@@ -1,6 +1,10 @@
+omp-side-session includes code and design adapted from
+@pi-kaush/pi-btw-with-imports:
+https://github.com/kaushikgopal/pi-kaush/tree/main/extensions/pi-btw-with-imports
+
 MIT License
 
-Copyright (c) 2026 Thien Nguyen
+Copyright (c) 2026 Kaushik Gopal
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
