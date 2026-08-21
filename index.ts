@@ -5,6 +5,13 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type {
+	ExecResult,
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	SessionEntry,
+} from "@oh-my-pi/pi-coding-agent";
 
 const CHILD_MARKER_TYPE = "omp-side-session-child-v1";
 const LAYOUT_MARKER_TYPE = "omp-side-session-layout-v1";
@@ -15,6 +22,7 @@ const HANDOFF_MESSAGE_TYPE = "omp-side-session-handoff-v1";
 const HANDOFF_ID_PATTERN = /<!-- omp-side-handoff:([A-Za-z0-9-]+) -->\s*$/;
 const pendingHandoffDeliveries = new WeakMap<object, Map<string, number>>();
 const INTERNAL_LAUNCH_COMMAND = "/side --launch";
+const INTERNAL_REOPEN_COMMAND = "/side --reopen";
 const EXEC_TIMEOUT_MS = 15_000;
 const START_RETRY_DELAY_MS = 100;
 const START_MAX_ATTEMPTS = 30;
@@ -36,90 +44,21 @@ Return only a concise, self-contained result. Preserve:
 - unresolved risks or questions.
 
 Exclude exploratory chatter, discarded hypotheses, tool logs, and these instructions.`;
+type ExtensionApi = ExtensionAPI;
 
-interface ExecResult {
-	stdout: string;
-	stderr: string;
-	code: number;
-	killed?: boolean;
+interface SideArgumentCompletion {
+	value: string;
+	label: string;
+	description: string;
+	hint: string;
 }
 
-interface ExecOptions {
-	timeout?: number;
-}
-
-interface SessionEntry {
-	type: string;
-	id: string;
-	parentId: string | null;
-	customType?: string;
-	data?: unknown;
-	content?: unknown;
-	details?: unknown;
-	message?: {
-		role?: string;
-		content?: unknown;
-		stopReason?: string;
-	};
-}
-
-interface ReadonlySessionManager {
-	getSessionFile(): string | undefined;
-	getSessionDir(): string;
-	getSessionId(): string;
-	getLeafId(): string | null;
-	getEntries(): SessionEntry[];
-	getBranch(): SessionEntry[];
-}
-
-interface WritableSessionManager extends ReadonlySessionManager {
-	createBranchedSession(leafId: string): string | undefined;
-	appendMessage(message: unknown): string;
-	appendModelChange(provider: string, modelId: string): string;
-	appendThinkingLevelChange(level: string): string;
-	appendCustomEntry(customType: string, data?: unknown): string;
-	setSessionName(name: string, source?: "auto" | "user"): Promise<boolean>;
-	ensureOnDisk(): Promise<void>;
-	flush(): Promise<void>;
-	close(): Promise<void>;
-}
+type CustomSessionEntry = Extract<SessionEntry, { type: "custom" }>;
+type MessageSessionEntry = Extract<SessionEntry, { type: "message" }>;
 
 export interface HerdrPaneLayout {
 	area: { width: number };
 	panes: Array<{ pane_id: string; rect: { x: number; width: number } }>;
-}
-
-interface SessionContextSnapshot {
-	messages: Array<{ role?: string }>;
-	model?: { provider: string; modelId: string };
-	thinkingLevel: string;
-}
-
-interface CodingAgentExports {
-	SessionManager: {
-		open(
-			filePath: string,
-			sessionDir?: string,
-			storage?: unknown,
-			options?: { suppressBreadcrumb?: boolean },
-		): Promise<WritableSessionManager>;
-		create(cwd: string, sessionDir?: string): WritableSessionManager;
-	};
-	buildSessionContext(entries: SessionEntry[], leafId?: string | null): SessionContextSnapshot;
-}
-
-interface UiContext {
-	notify(message: string, level?: "info" | "warning" | "error"): void;
-	select(title: string, options: Array<string | { label: string; description?: string }>): Promise<string | undefined>;
-	confirm(title: string, message: string): Promise<boolean>;
-}
-
-interface ExtensionContext {
-	cwd: string;
-	ui: UiContext;
-	sessionManager: ReadonlySessionManager;
-	waitForIdle?(): Promise<void>;
-	isIdle?(): boolean;
 }
 
 interface BoundaryResize {
@@ -128,40 +67,6 @@ interface BoundaryResize {
 	amount: number;
 	rollbackPaneId: string;
 	rollbackDirection: "left" | "right";
-}
-
-interface ExtensionEvent {
-	type: string;
-	willContinue?: boolean;
-}
-interface SideArgumentCompletion {
-	value: string;
-	label: string;
-	description: string;
-	hint: string;
-}
-
-interface ExtensionApi {
-	pi: CodingAgentExports;
-	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
-	on(
-		event: "session_start" | "session_switch" | "session_shutdown" | "agent_end",
-		handler: (event: ExtensionEvent, ctx: ExtensionContext) => Promise<void> | void,
-	): void;
-	registerCommand(
-		name: string,
-		options: {
-			description?: string;
-			getArgumentCompletions?: (argumentPrefix: string) => SideArgumentCompletion[] | null;
-			handler(args: string, ctx: ExtensionContext): Promise<void>;
-		},
-	): void;
-	sendMessage(
-		message: { customType: string; content: string; details?: unknown; display: boolean; attribution?: "agent" },
-		options?: { deliverAs?: "nextTurn"; triggerTurn?: boolean },
-	): void;
-	appendEntry(customType: string, data?: unknown): void;
-	sendUserMessage(content: string): void;
 }
 
 interface ChildMarker {
@@ -177,6 +82,7 @@ interface SideRecord {
 	agentName: string;
 	sessionFile: string;
 	title: string;
+	detached?: boolean;
 }
 
 interface SideLayoutMarker {
@@ -330,7 +236,8 @@ function isSideRecord(value: unknown): value is SideRecord {
 		typeof record.sessionFile === "string" &&
 		record.sessionFile.length > 0 &&
 		typeof record.title === "string" &&
-		record.title.length > 0
+		record.title.length > 0 &&
+		(record.detached === undefined || typeof record.detached === "boolean")
 	);
 }
 
@@ -563,63 +470,53 @@ function sideTitle(sideNumber: number, prompt: string | undefined): string {
 	return `Side ${sideNumber}: ${preview.slice(0, 64)}`;
 }
 
-async function snapshotInMemorySession(
-	pi: ExtensionApi,
-	ctx: ExtensionContext,
-	leafId: string | null,
-): Promise<WritableSessionManager> {
-	const snapshot = pi.pi.buildSessionContext(ctx.sessionManager.getEntries(), leafId);
-	const unsupported = snapshot.messages.find(
-		message => message.role === "branchSummary" || message.role === "compactionSummary",
-	);
-	if (unsupported) {
-		throw new Error(`Cannot snapshot ${String(unsupported.role)} context before the main session is persisted`);
-	}
-	const child = pi.pi.SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir());
-	for (const message of snapshot.messages) child.appendMessage(message);
-	if (snapshot.model) child.appendModelChange(snapshot.model.provider, snapshot.model.modelId);
-	child.appendThinkingLevelChange(snapshot.thinkingLevel);
-	return child;
+function sideDisplayTitle(side: SideRecord): string {
+	const bareTitle = `Side ${side.sideNumber}`;
+	return side.title === bareTitle ? "(untitled)" : side.title.replace(/^Side \d+:\s*/, "");
 }
 
 async function createSideSession(
 	pi: ExtensionApi,
-	ctx: ExtensionContext,
+	ctx: ExtensionCommandContext,
 	parentPaneId: string,
 	sideNumber: number,
 	prompt: string | undefined,
 ): Promise<CreatedSideSession> {
 	const forkLeaf = settledForkLeaf(ctx);
 	const sourceFile = ctx.sessionManager.getSessionFile();
-	let child: WritableSessionManager;
-
-	if (sourceFile && existsSync(sourceFile) && forkLeaf) {
-		child = await pi.pi.SessionManager.open(sourceFile, ctx.sessionManager.getSessionDir());
-		const sessionFile = child.createBranchedSession(forkLeaf);
-		if (!sessionFile) throw new Error("Failed to persist the side-session fork");
-	} else {
-		child = await snapshotInMemorySession(pi, ctx, forkLeaf);
+	if (!sourceFile || !existsSync(sourceFile) || !forkLeaf) {
+		throw new Error("Main has no durable settled turn to fork");
 	}
 
-	const title = sideTitle(sideNumber, prompt);
-	await child.setSessionName(title, "user");
-	child.appendCustomEntry(CHILD_MARKER_TYPE, {
-		parentSessionId: ctx.sessionManager.getSessionId(),
-		parentPaneId,
-		sideNumber,
-		...(prompt ? { prompt } : {}),
-	} satisfies ChildMarker);
-	await child.ensureOnDisk();
-	await child.flush();
-	const sessionFile = child.getSessionFile();
-	if (!sessionFile) throw new Error("Side session has no persisted session file");
-	return { sessionFile, prompt, title };
+	const child = await pi.pi.SessionManager.open(sourceFile, ctx.sessionManager.getSessionDir(), undefined, {
+		suppressBreadcrumb: true,
+	});
+	try {
+		const sessionFile = child.createBranchedSession(forkLeaf);
+		if (!sessionFile) throw new Error("Failed to persist the side-session fork");
+
+		const title = sideTitle(sideNumber, prompt);
+		await child.setSessionName(title, "user");
+		child.appendCustomEntry(CHILD_MARKER_TYPE, {
+			parentSessionId: ctx.sessionManager.getSessionId(),
+			parentPaneId,
+			sideNumber,
+			...(prompt ? { prompt } : {}),
+		} satisfies ChildMarker);
+		await child.ensureOnDisk();
+		await child.flush();
+		await pi.pi.copySessionArtifacts(sourceFile, sessionFile);
+		return { sessionFile, prompt, title };
+	} finally {
+		await child.close();
+	}
 }
 
-function managedSideSessionPath(ctx: ExtensionContext, sessionFile: string): string {
+async function managedSideSessionPath(ctx: ExtensionContext, sessionFile: string): Promise<string> {
 	const resolved = path.resolve(sessionFile);
-	const activeSessionDir = path.resolve(ctx.sessionManager.getSessionDir());
-	const candidateDir = path.dirname(resolved);
+	const lexicalCandidateDir = path.dirname(resolved);
+	const activeSessionDir = await fs.realpath(path.resolve(ctx.sessionManager.getSessionDir()));
+	const candidateDir = await fs.realpath(lexicalCandidateDir);
 	const managedSessionsRoot = path.dirname(activeSessionDir);
 	const isActiveSessionDir = candidateDir === activeSessionDir;
 	const isManagedProjectDir =
@@ -627,10 +524,22 @@ function managedSideSessionPath(ctx: ExtensionContext, sessionFile: string): str
 	if (path.extname(resolved) !== ".jsonl" || (!isActiveSessionDir && !isManagedProjectDir)) {
 		throw new Error("Refusing to delete a side session outside the managed sessions root.");
 	}
-	return resolved;
+
+	try {
+		const candidate = await fs.lstat(resolved);
+		if (candidate.isSymbolicLink()) {
+			throw new Error("Refusing to delete a side session through a symbolic link.");
+		}
+		return await fs.realpath(resolved);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return path.join(candidateDir, path.basename(resolved));
+		}
+		throw error;
+	}
 }
 async function removeSideSession(ctx: ExtensionContext, sessionFile: string): Promise<void> {
-	const resolved = managedSideSessionPath(ctx, sessionFile);
+	const resolved = await managedSideSessionPath(ctx, sessionFile);
 	const results = await Promise.allSettled([
 		fs.rm(resolved, { force: true }),
 		fs.rm(resolved.slice(0, -".jsonl".length), { recursive: true, force: true }),
@@ -735,7 +644,9 @@ function pendingHandoffsFromBranch(
 	parentSessionId: string,
 	importedIds: Set<string>,
 ): PendingHandoff[] {
-	const markerEntry = branch.find(entry => entry.type === "custom" && entry.customType === CHILD_MARKER_TYPE);
+	const markerEntry = branch.find(
+		(entry): entry is CustomSessionEntry => entry.type === "custom" && entry.customType === CHILD_MARKER_TYPE,
+	);
 	const marker = markerEntry?.data as Partial<ChildMarker> | undefined;
 	if (!marker || marker.parentSessionId !== parentSessionId) {
 		throw new Error(`Side ${side.sideNumber} is not linked to this Main session.`);
@@ -746,7 +657,7 @@ function pendingHandoffsFromBranch(
 		const readyEntry = branch[readyIndex];
 		if (!readyEntry) continue;
 		const ready = getHandoffReady(readyEntry);
-		if (readyEntry.customType === HANDOFF_READY_TYPE && !ready) {
+		if (readyEntry.type === "custom" && readyEntry.customType === HANDOFF_READY_TYPE && !ready) {
 			throw new Error(`Side ${side.sideNumber} has a malformed handoff record.`);
 		}
 		if (!ready || importedIds.has(ready.requestId)) continue;
@@ -763,18 +674,20 @@ function pendingHandoffsFromBranch(
 			throw new Error(`Side ${side.sideNumber} has an incomplete handoff record.`);
 		}
 		const intent = getHandoffIntent(intentEntry);
-		const content = extractMessageText(answerEntry.message?.content);
 		if (
 			!intent ||
 			intent.requestId !== ready.requestId ||
 			promptEntry.type !== "message" ||
-			promptEntry.message?.role !== "user" ||
+			promptEntry.message.role !== "user" ||
 			extractMessageText(promptEntry.message.content) !== intent.handoffPrompt ||
 			answerEntry.type !== "message" ||
-			answerEntry.message?.role !== "assistant" ||
-			answerEntry.message.stopReason !== "stop" ||
-			!content
+			answerEntry.message.role !== "assistant" ||
+			answerEntry.message.stopReason !== "stop"
 		) {
+			throw new Error(`Side ${side.sideNumber} handoff provenance validation failed.`);
+		}
+		const content = extractMessageText(answerEntry.message.content);
+		if (!content) {
 			throw new Error(`Side ${side.sideNumber} handoff provenance validation failed.`);
 		}
 		pending.push({
@@ -856,6 +769,17 @@ function withoutSidePane(state: SideLayoutMarker, paneId: string): SideLayoutMar
 	};
 }
 
+function withDetachedSide(state: SideLayoutMarker, paneId: string): SideLayoutMarker {
+	return {
+		parentPaneId: state.parentPaneId,
+		columns: state.columns
+			.map(column => column.filter(candidate => candidate !== paneId))
+			.filter(column => column.length > 0),
+		paneNumbers: { ...(state.paneNumbers ?? {}) },
+		sides: (state.sides ?? []).map(side => (side.paneId === paneId ? { ...side, detached: true } : side)),
+	};
+}
+
 function appendLayoutState(pi: Pick<ExtensionApi, "appendEntry">, state: SideLayoutMarker): void {
 	pi.appendEntry(LAYOUT_MARKER_TYPE, {
 		parentPaneId: state.parentPaneId,
@@ -906,41 +830,18 @@ async function reconcileSideLifecycle(pi: ExtensionApi, ctx: ExtensionContext, n
 	let changed = false;
 
 	for (const side of [...(state.sides ?? [])]) {
+		if (side.detached) continue;
 		const exists = await herdrPaneExists(pi, herdr, side.paneId);
 		if (exists !== false) continue;
-		let pending: PendingHandoff[];
-		try {
-			pending = await pendingHandoffsForSide(pi, ctx, side);
-		} catch (error) {
-			const key = `cleanup-error:${side.paneId}:${errorMessage(error)}`;
-			if (!notified.has(key)) {
-				notified.add(key);
-				ctx.ui.notify(
-					`Side ${side.sideNumber} closed, but its session was retained: ${errorMessage(error)}`,
-					"warning",
-				);
-			}
-			continue;
-		}
-		if (pending.length > 0) continue;
-		try {
-			await removeSideSession(ctx, side.sessionFile);
-			state = withoutSidePane(state, side.paneId);
-			changed = true;
-			const key = `deleted:${side.paneId}`;
-			if (!notified.has(key)) {
-				notified.add(key);
-				ctx.ui.notify(`Deleted Side ${side.sideNumber} after its pane closed.`, "info");
-			}
-		} catch (error) {
-			const key = `delete-error:${side.paneId}:${errorMessage(error)}`;
-			if (!notified.has(key)) {
-				notified.add(key);
-				ctx.ui.notify(
-					`Could not delete Side ${side.sideNumber}; cleanup will retry: ${errorMessage(error)}`,
-					"warning",
-				);
-			}
+		state = withDetachedSide(state, side.paneId);
+		changed = true;
+		const key = `detached:${side.paneId}`;
+		if (!notified.has(key)) {
+			notified.add(key);
+			ctx.ui.notify(
+				`Side ${side.sideNumber} pane closed; its session was retained. Use /side reopen ${side.sideNumber} or /side close ${side.sideNumber}.`,
+				"info",
+			);
 		}
 	}
 
@@ -984,7 +885,32 @@ async function reconcileSideLifecycle(pi: ExtensionApi, ctx: ExtensionContext, n
 	}
 }
 
-async function runSideClose(pi: ExtensionApi, ctx: ExtensionContext, rawTarget: string): Promise<void> {
+async function runSideList(pi: ExtensionApi, ctx: ExtensionCommandContext): Promise<void> {
+	if (childMarker(ctx)) {
+		ctx.ui.notify("/side list must be run from Main.", "warning");
+		return;
+	}
+	const parentPaneId = process.env.HERDR_PANE_ID;
+	if (process.env.HERDR_ENV !== "1" || !parentPaneId) {
+		ctx.ui.notify("/side list requires Main to be running inside Herdr.", "error");
+		return;
+	}
+	await reconcileSideLifecycle(pi, ctx, new Set());
+	const sides = latestSideLayout(ctx, parentPaneId)?.sides ?? [];
+	if (sides.length === 0) {
+		ctx.ui.notify("No tracked side conversations.", "info");
+		return;
+	}
+	const lines = sides
+		.toSorted((left, right) => left.sideNumber - right.sideNumber)
+		.map(side => {
+			const status = side.detached ? `detached; /side reopen ${side.sideNumber}` : "open";
+			return `Side ${side.sideNumber} [${status}] ${sideDisplayTitle(side)}`;
+		});
+	ctx.ui.notify(`Side conversations:\n${lines.join("\n")}`, "info");
+}
+
+async function runSideClose(pi: ExtensionApi, ctx: ExtensionCommandContext, rawTarget: string): Promise<void> {
 	if (childMarker(ctx)) {
 		ctx.ui.notify("Run /side close from Main to close this side safely.", "warning");
 		return;
@@ -1016,7 +942,7 @@ async function runSideClose(pi: ExtensionApi, ctx: ExtensionContext, rawTarget: 
 	} else {
 		const labels = sides
 			.toSorted((left, right) => left.sideNumber - right.sideNumber)
-			.map(side => `Side ${side.sideNumber}: ${side.title.replace(/^Side \d+:\s*/, "")}`);
+			.map(side => `Side ${side.sideNumber}: ${sideDisplayTitle(side)}`);
 		const choice = await ctx.ui.select("Choose a side conversation to close", labels);
 		if (!choice) return;
 		const match = /^Side (\d+):/.exec(choice);
@@ -1041,27 +967,29 @@ async function runSideClose(pi: ExtensionApi, ctx: ExtensionContext, rawTarget: 
 			: ` This also discards ${pending.length} pending handoff${pending.length === 1 ? "" : "s"}.`;
 	const confirmed = await ctx.ui.confirm(
 		`Close Side ${selected.sideNumber}?`,
-		`Close its Herdr pane and permanently delete ${selected.sessionFile}?${pendingWarning}`,
+		`${selected.detached ? "Permanently delete" : "Close its Herdr pane and permanently delete"} ${selected.sessionFile}?${pendingWarning}`,
 	);
 	if (!confirmed) return;
 
 	const herdr = herdrBinaryPath();
-	const exists = await herdrPaneExists(pi, herdr, selected.paneId);
-	if (exists === undefined) {
-		ctx.ui.notify(`Could not inspect Side ${selected.sideNumber}'s Herdr pane.`, "error");
-		return;
-	}
-	if (exists) {
-		const closed = await pi.exec(herdr, ["pane", "close", selected.paneId], {
-			timeout: EXEC_TIMEOUT_MS,
-		});
-		const closeFailure = execFailure(closed, "Herdr pane close failed");
-		if (closeFailure || !(await waitForPaneClosed(pi, herdr, selected.paneId))) {
-			ctx.ui.notify(
-				`Could not confirm that Side ${selected.sideNumber} exited: ${closeFailure ?? "pane remained open"}`,
-				"error",
-			);
+	if (!selected.detached) {
+		const exists = await herdrPaneExists(pi, herdr, selected.paneId);
+		if (exists === undefined) {
+			ctx.ui.notify(`Could not inspect Side ${selected.sideNumber}'s Herdr pane.`, "error");
 			return;
+		}
+		if (exists) {
+			const closed = await pi.exec(herdr, ["pane", "close", selected.paneId], {
+				timeout: EXEC_TIMEOUT_MS,
+			});
+			const closeFailure = execFailure(closed, "Herdr pane close failed");
+			if (closeFailure || !(await waitForPaneClosed(pi, herdr, selected.paneId))) {
+				ctx.ui.notify(
+					`Could not confirm that Side ${selected.sideNumber} exited: ${closeFailure ?? "pane remained open"}`,
+					"error",
+				);
+				return;
+			}
 		}
 	}
 
@@ -1120,6 +1048,7 @@ export async function launchHerdrSide(
 	placement: SidePanePlacement,
 	sessionFile: string,
 	title: string,
+	bootstrapCommand = INTERNAL_LAUNCH_COMMAND,
 ): Promise<LaunchResult> {
 	const herdr = herdrBinaryPath();
 	if (placement.resize) {
@@ -1263,7 +1192,7 @@ export async function launchHerdrSide(
 	}
 
 	try {
-		const sent = await pi.exec(herdr, ["agent", "prompt", agentName, INTERNAL_LAUNCH_COMMAND], {
+		const sent = await pi.exec(herdr, ["agent", "prompt", agentName, bootstrapCommand], {
 			timeout: EXEC_TIMEOUT_MS,
 		});
 		const promptFailure = execFailure(sent, "Herdr side bootstrap failed");
@@ -1317,8 +1246,8 @@ async function finalizePendingChildHandoff(
 	const pending = latestUnfinalizedHandoff(branch);
 	if (!pending) return;
 	const intentIndex = branch.findIndex(entry => entry.id === pending.entry.id);
-	let promptEntry: SessionEntry | undefined;
-	let answerEntry: SessionEntry | undefined;
+	let promptEntry: MessageSessionEntry | undefined;
+	let answerEntry: MessageSessionEntry | undefined;
 	for (let index = intentIndex + 1; index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry?.type !== "message") continue;
@@ -1332,7 +1261,14 @@ async function finalizePendingChildHandoff(
 			answerEntry = entry;
 		}
 	}
-	if (!promptEntry || !answerEntry || !extractMessageText(answerEntry.message?.content)) return;
+	if (
+		!promptEntry ||
+		!answerEntry ||
+		!("content" in answerEntry.message) ||
+		!extractMessageText(answerEntry.message.content)
+	) {
+		return;
+	}
 	pi.appendEntry(HANDOFF_READY_TYPE, {
 		requestId: pending.intent.requestId,
 		intentEntryId: pending.entry.id,
@@ -1342,13 +1278,13 @@ async function finalizePendingChildHandoff(
 	ctx.ui.notify("Handoff ready. It will appear in Main when Main is idle.", "info");
 }
 
-async function runSideHandoff(pi: ExtensionApi, ctx: ExtensionContext, focus: string): Promise<void> {
+async function runSideHandoff(pi: ExtensionApi, ctx: ExtensionCommandContext, focus: string): Promise<void> {
 	const marker = childMarker(ctx);
 	if (!marker) {
 		ctx.ui.notify("/side handoff must be run from a side conversation.", "warning");
 		return;
 	}
-	await ctx.waitForIdle?.();
+	await ctx.waitForIdle();
 	if (latestUnfinalizedHandoff(ctx.sessionManager.getBranch())) {
 		ctx.ui.notify("This side is already preparing a handoff.", "warning");
 		return;
@@ -1366,7 +1302,7 @@ async function runSideHandoff(pi: ExtensionApi, ctx: ExtensionContext, focus: st
 }
 
 function handoffImportContent(handoff: PendingHandoff): string {
-	return `Imported handoff from Side ${handoff.side.sideNumber}: ${handoff.side.title.replace(/^Side \d+:\s*/, "")}\n\n---\n\n${handoff.content}\n\n<!-- omp-side-handoff:${handoff.requestId} -->`;
+	return `Imported handoff from Side ${handoff.side.sideNumber}: ${sideDisplayTitle(handoff.side)}\n\n---\n\n${handoff.content}\n\n<!-- omp-side-handoff:${handoff.requestId} -->`;
 }
 
 function importPendingHandoff(
@@ -1408,7 +1344,7 @@ function importPendingHandoff(
 	return true;
 }
 
-async function runMainRecovery(pi: ExtensionApi, ctx: ExtensionContext, rawTarget: string): Promise<void> {
+async function runMainRecovery(pi: ExtensionApi, ctx: ExtensionCommandContext, rawTarget: string): Promise<void> {
 	if (childMarker(ctx)) {
 		ctx.ui.notify("/side recover must be run from Main.", "warning");
 		return;
@@ -1476,18 +1412,18 @@ async function runMainRecovery(pi: ExtensionApi, ctx: ExtensionContext, rawTarge
 	ctx.ui.notify(`Recovered Side ${selected.side.sideNumber}'s handoff without starting a turn.`, "info");
 }
 
-async function runInternalLaunch(pi: ExtensionApi, ctx: ExtensionContext): Promise<void> {
+async function runInternalLaunch(pi: ExtensionApi, ctx: ExtensionCommandContext): Promise<void> {
 	const marker = childMarker(ctx);
 	if (!marker) {
 		ctx.ui.notify("/side --launch is only valid inside a side session.", "warning");
 		return;
 	}
-	await ctx.waitForIdle?.();
+	await ctx.waitForIdle();
 	pi.sendMessage(
 		{
 			customType: "omp-side-session-context-v1",
 			content:
-				"This is an independent side conversation forked from the visible main session. Answer the side request without continuing or editing the main session's task unless the user explicitly asks you to do so.",
+				"This conversation state is independent from Main, but both processes share the same working directory, files, Git worktree, and services. Answer the side request without continuing Main's task or modifying shared state unless the user explicitly asks you to do so; avoid concurrent edits with Main.",
 			display: false,
 			attribution: "agent",
 		},
@@ -1499,6 +1435,15 @@ async function runInternalLaunch(pi: ExtensionApi, ctx: ExtensionContext): Promi
 	}
 	pi.sendUserMessage(marker.prompt);
 	ctx.ui.notify("Started the side conversation.", "info");
+}
+
+async function runInternalReopen(ctx: ExtensionCommandContext): Promise<void> {
+	if (!childMarker(ctx)) {
+		ctx.ui.notify("/side --reopen is only valid inside a side session.", "warning");
+		return;
+	}
+	await ctx.waitForIdle();
+	ctx.ui.notify("Side conversation resumed.", "info");
 }
 
 function recordSidePane(
@@ -1527,11 +1472,123 @@ function recordSidePane(
 		parentPaneId,
 		columns,
 		paneNumbers,
-		sides: [...existingSides.filter(existing => existing.paneId !== side.paneId), side],
+		sides: [
+			...existingSides.filter(existing => existing.paneId !== side.paneId && existing.sideNumber !== side.sideNumber),
+			side,
+		],
 	});
 }
 
-async function runSide(pi: ExtensionApi, ctx: ExtensionContext, rawPrompt: string): Promise<void> {
+async function runSideReopen(pi: ExtensionApi, ctx: ExtensionCommandContext, rawTarget: string): Promise<void> {
+	if (childMarker(ctx)) {
+		ctx.ui.notify("/side reopen must be run from Main.", "warning");
+		return;
+	}
+	const parentPaneId = process.env.HERDR_PANE_ID;
+	if (process.env.HERDR_ENV !== "1" || !parentPaneId) {
+		ctx.ui.notify("/side reopen requires Main to be running inside Herdr.", "error");
+		return;
+	}
+	await reconcileSideLifecycle(pi, ctx, new Set());
+	const state = latestSideLayout(ctx, parentPaneId);
+	const detachedSides = (state?.sides ?? []).filter(side => side.detached);
+	if (!state || detachedSides.length === 0) {
+		ctx.ui.notify("No detached side conversations.", "info");
+		return;
+	}
+
+	let selected: SideRecord | undefined;
+	const target = rawTarget.trim();
+	if (target) {
+		const sideNumber = Number(target);
+		selected = Number.isInteger(sideNumber) ? detachedSides.find(side => side.sideNumber === sideNumber) : undefined;
+		if (!selected) {
+			ctx.ui.notify(`No detached Side ${target}.`, "warning");
+			return;
+		}
+	} else if (detachedSides.length === 1) {
+		selected = detachedSides[0];
+	} else {
+		const labels = detachedSides
+			.toSorted((left, right) => left.sideNumber - right.sideNumber)
+			.map(side => `Side ${side.sideNumber}: ${sideDisplayTitle(side)}`);
+		const choice = await ctx.ui.select("Choose a side conversation to reopen", labels);
+		if (!choice) return;
+		const match = /^Side (\d+):/.exec(choice);
+		selected = match ? detachedSides.find(side => side.sideNumber === Number(match[1])) : undefined;
+		if (!selected) {
+			ctx.ui.notify("The selected side is no longer available.", "warning");
+			return;
+		}
+	}
+	if (!existsSync(selected.sessionFile)) {
+		ctx.ui.notify(
+			`Cannot reopen Side ${selected.sideNumber}; its session file is missing. Use /side close ${selected.sideNumber} to remove the stale record.`,
+			"error",
+		);
+		return;
+	}
+
+	let resolved: ResolvedSideLayout;
+	try {
+		const inspected = await pi.exec(herdrBinaryPath(), ["pane", "layout", "--pane", parentPaneId], {
+			timeout: EXEC_TIMEOUT_MS,
+		});
+		const inspectFailure = execFailure(inspected, "Herdr pane layout inspection failed");
+		if (inspectFailure) throw new Error(inspectFailure);
+		const paneNumbers = { ...(state.paneNumbers ?? {}) };
+		delete paneNumbers[selected.paneId];
+		resolved = resolveSideLayout(parentPaneId, state.columns, parseHerdrPaneLayout(inspected.stdout), paneNumbers);
+	} catch (error) {
+		ctx.ui.notify(`Could not inspect the side-pane layout: ${errorMessage(error)}`, "error");
+		return;
+	}
+	if (!resolved.placement) {
+		ctx.ui.notify("Four side conversations are already open. Close one before reopening another.", "warning");
+		return;
+	}
+	const placement = { ...resolved.placement, sideNumber: selected.sideNumber };
+	const launched = await launchHerdrSide(
+		pi,
+		ctx,
+		placement,
+		selected.sessionFile,
+		selected.title,
+		INTERNAL_REOPEN_COMMAND,
+	);
+	if (launched.agentStarted && launched.paneId) {
+		try {
+			if (!launched.agentName) throw new Error("The reopened Herdr agent name is missing.");
+			recordSidePane(pi, parentPaneId, resolved, placement, state.sides ?? [], {
+				...selected,
+				paneId: launched.paneId,
+				agentName: launched.agentName,
+				detached: false,
+			});
+		} catch (error) {
+			ctx.ui.notify(
+				`Reopened ${launched.agentName ?? `Side ${selected.sideNumber}`}, but could not save its lifecycle state: ${errorMessage(error)}`,
+				"error",
+			);
+			return;
+		}
+	}
+	if (!launched.ok) {
+		ctx.ui.notify(
+			launched.agentStarted
+				? `Reopened Side ${selected.sideNumber}, but could not finish its private bootstrap: ${launched.reason}. Continue in the side pane.`
+				: `Could not reopen Side ${selected.sideNumber}: ${launched.reason}. Its session was retained.`,
+			"error",
+		);
+		return;
+	}
+	if (launched.warning) {
+		ctx.ui.notify(`Side ${selected.sideNumber} reopened with a labeling warning: ${launched.warning}`, "warning");
+	}
+	ctx.ui.notify(`Reopened Side ${selected.sideNumber} in the paired layout.`, "info");
+}
+
+async function runSide(pi: ExtensionApi, ctx: ExtensionCommandContext, rawPrompt: string): Promise<void> {
 	if (childMarker(ctx)) {
 		ctx.ui.notify("Nested /side sessions are disabled; continue in this side conversation.", "warning");
 		return;
@@ -1552,9 +1609,16 @@ async function runSide(pi: ExtensionApi, ctx: ExtensionContext, rawPrompt: strin
 	}
 	await reconcileSideLifecycle(pi, ctx, new Set());
 
+	const stored = latestSideLayout(ctx, parentPaneId);
+	if ((stored?.sides ?? []).length >= MAX_SIDE_PANES) {
+		ctx.ui.notify(
+			"Four side conversations are already tracked for this main pane. Close one before opening another.",
+			"warning",
+		);
+		return;
+	}
 	const herdr = herdrBinaryPath();
 	let resolved: ResolvedSideLayout;
-	let stored: SideLayoutMarker | undefined;
 	try {
 		const inspected = await pi.exec(herdr, ["pane", "layout", "--pane", parentPaneId], {
 			timeout: EXEC_TIMEOUT_MS,
@@ -1562,7 +1626,6 @@ async function runSide(pi: ExtensionApi, ctx: ExtensionContext, rawPrompt: strin
 		const inspectFailure = execFailure(inspected, "Herdr pane layout inspection failed");
 		if (inspectFailure) throw new Error(inspectFailure);
 		const layout = parseHerdrPaneLayout(inspected.stdout);
-		stored = latestSideLayout(ctx, parentPaneId);
 		resolved = resolveSideLayout(parentPaneId, stored?.columns ?? [], layout, stored?.paneNumbers ?? {});
 	} catch (error) {
 		ctx.ui.notify(`Could not inspect the side-pane layout: ${errorMessage(error)}`, "error");
@@ -1642,10 +1705,28 @@ function completeSideArguments(argumentPrefix: string): SideArgumentCompletion[]
 	const lower = argumentPrefix.toLowerCase();
 	const matches = [
 		{
+			value: "-- ",
+			label: "--",
+			description: "Open a question beginning with a reserved command word",
+			hint: "[question]",
+		},
+		{
 			value: "close ",
 			label: "close",
 			description: "Close and delete a paired Side from Main",
 			hint: "[number]",
+		},
+		{
+			value: "reopen ",
+			label: "reopen",
+			description: "Reopen a detached Side from Main",
+			hint: "[number]",
+		},
+		{
+			value: "list",
+			label: "list",
+			description: "List open and detached Sides from Main",
+			hint: "",
 		},
 		{
 			value: "handoff ",
@@ -1664,21 +1745,23 @@ function completeSideArguments(argumentPrefix: string): SideArgumentCompletion[]
 }
 
 export default function ompSideSession(pi: ExtensionApi): void {
-	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	let pollTimer: Timer | undefined;
+	let pollContext: ExtensionContext | undefined;
 	let pollGeneration = 0;
 	let maintenanceInFlight = false;
 	const notified = new Set<string>();
 
 	const stopPolling = (): void => {
 		pollGeneration++;
-		clearInterval(pollTimer);
+		if (pollTimer && pollContext) pollContext.clearTimer(pollTimer);
 		pollTimer = undefined;
+		pollContext = undefined;
 		maintenanceInFlight = false;
 		notified.clear();
 	};
 	const maintain = async (ctx: ExtensionContext, generation: number): Promise<void> => {
 		if (generation !== pollGeneration || maintenanceInFlight) return;
-		if (ctx.isIdle?.() === false) return;
+		if (!ctx.isIdle()) return;
 		maintenanceInFlight = true;
 		try {
 			if (childMarker(ctx)) {
@@ -1697,8 +1780,8 @@ export default function ompSideSession(pi: ExtensionApi): void {
 		const generation = pollGeneration;
 		void maintain(ctx, generation);
 		if (childMarker(ctx) || process.env.HERDR_ENV !== "1") return;
-		pollTimer = setInterval(() => void maintain(ctx, generation), LIFECYCLE_POLL_INTERVAL_MS);
-		pollTimer.unref?.();
+		pollContext = ctx;
+		pollTimer = ctx.setInterval(() => void maintain(ctx, generation), LIFECYCLE_POLL_INTERVAL_MS);
 	};
 
 	pi.on("session_start", async (_event, ctx) => startPolling(ctx));
@@ -1714,7 +1797,7 @@ export default function ompSideSession(pi: ExtensionApi): void {
 	pi.on("session_shutdown", async () => stopPolling());
 
 	pi.registerCommand("side", {
-		description: "Open, close, hand off, or recover a paired Herdr side conversation",
+		description: "Open, list, close, reopen, hand off, or recover a paired Herdr side conversation",
 		getArgumentCompletions: completeSideArguments,
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
@@ -1722,9 +1805,25 @@ export default function ompSideSession(pi: ExtensionApi): void {
 				await runInternalLaunch(pi, ctx);
 				return;
 			}
+			if (trimmed === "--reopen") {
+				await runInternalReopen(ctx);
+				return;
+			}
+			if (trimmed === "--" || trimmed.startsWith("-- ")) {
+				await runSide(pi, ctx, trimmed === "--" ? "" : trimmed.slice(3));
+				return;
+			}
 			const [verb = "", ...rest] = trimmed.split(/\s+/);
 			if (verb === "close") {
 				await runSideClose(pi, ctx, rest.join(" "));
+				return;
+			}
+			if (verb === "reopen") {
+				await runSideReopen(pi, ctx, rest.join(" "));
+				return;
+			}
+			if (verb === "list") {
+				await runSideList(pi, ctx);
 				return;
 			}
 			if (verb === "handoff") {

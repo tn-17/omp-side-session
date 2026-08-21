@@ -6,6 +6,7 @@
 		"noEmit": true,
 		"strict": true,
 		"target": "ESNext",
+		"skipLibCheck": true,
 		"types": ["bun"]
 	},
 	"include": ["index.ts", "test.ts"]
